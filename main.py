@@ -7,6 +7,8 @@ from sentence_transformers import CrossEncoder
 from fastapi import FastAPI
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+import joblib
+from langchain_classic.retrievers import EnsembleRetriever
 
 class QuestionResponse(BaseModel):
     question:str
@@ -19,15 +21,23 @@ embeddings=None
 pipe=None
 vector_db=None
 rerank=None
+keyword_retriever=None
+hybrid_retriever=None
 
 @asynccontextmanager
 async def lifespan(app:FastAPI):
-    global embeddings,pipe,vector_db,rerank
+    global embeddings,pipe,vector_db,rerank,keyword_retriever,hybrid_retriever
 
     embeddings=HuggingFaceEmbeddings(model_name='BAAI/bge-small-en-v1.5')
     print('Embeddings Loaded')
     vector_db=FAISS.load_local('Vector DB Index',embeddings=embeddings,allow_dangerous_deserialization=True)
     print('Vector DB Loaded')
+    vector_retriever=vector_db.as_retriever(search_kwargs={'k':15})
+    keyword_retriever=joblib.load('keyword retriever.pkl')
+    keyword_retriever.k=15
+    print('Keyword Retriever Loaded')
+    hybrid_retriever=EnsembleRetriever(retrievers=[vector_retriever,keyword_retriever],weights=[0.5,0.5])
+    print('Ensemble Retriever Loaded')
     MODEL='Qwen/Qwen2.5-1.5B-Instruct'
     tokenizer=AutoTokenizer.from_pretrained(MODEL)
     model=AutoModelForCausalLM.from_pretrained(MODEL,device_map='auto',dtype=torch.bfloat16,low_cpu_mem_usage=True)
@@ -44,6 +54,8 @@ async def lifespan(app:FastAPI):
     pipe=None
     rerank=None
     pipe=None
+    keyword_retriever=None
+    hybrid_retriever=None
 
 app=FastAPI(title='Crypto LLM RAG API',lifespan=lifespan)
 
@@ -60,7 +72,7 @@ def health():
 
 @app.post('/ask',response_model=ResponseClass)
 def predict(request:QuestionResponse):
-    initial_search=vector_db.similarity_search(query=request.question,k=25)
+    initial_search=hybrid_retriever.invoke(request.question)
     pairs=[[request.question,doc.page_content] for doc in initial_search]
     scores=rerank.predict(pairs)
     scored_results=sorted(zip(scores,initial_search),key=lambda x:x[0],reverse=True)
