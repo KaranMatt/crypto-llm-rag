@@ -25,7 +25,36 @@ This system was developed and tested on specialized financial and cryptocurrency
 - Venture capital strategies (VC-focused prompts, portfolio optimization, risk assessment)
 - Multi-domain synthesis (crypto markets + behavioral finance + AI/ML applications)
 
-The system successfully navigates these diverse domains through intelligent retrieval, precise reranking, and optimized generation parameters.
+The system successfully navigates these diverse domains through intelligent hybrid retrieval, precise reranking, and optimized generation parameters.
+
+---
+
+## What's New in This Version
+
+This version introduces **Hybrid Search**, a significant upgrade to the retrieval pipeline that combines dense semantic search with sparse keyword-based retrieval — along with an expanded retrieval pool.
+
+### Key Changes from Previous Version
+
+| Component | Previous Version | Current Version |
+|-----------|-----------------|-----------------|
+| **Retrieval Strategy** | Vector search only (dense) | Hybrid: Vector + BM25 keyword search |
+| **Retrieval Pool (k)** | k=25 (single retriever) | k=30 total (15 from vector + 15 from BM25) |
+| **Retrievers** | FAISS vector retriever | FAISS + BM25 via `EnsembleRetriever` |
+| **Ensemble Weights** | N/A | 50% vector, 50% BM25 |
+| **Artifacts** | Vector DB Index only | Vector DB Index + `keyword retriever.pkl` |
+
+### Why Hybrid Search is Better
+
+**Dense-only retrieval (old approach)** converts queries and documents into embedding vectors and finds the closest matches by cosine similarity. It excels at semantic understanding — finding passages that mean the same thing even if the words differ — but it can miss documents that contain the exact terminology a user typed, especially rare or domain-specific terms.
+
+**BM25 keyword retrieval (new addition)** is a classic term-frequency ranking algorithm. It excels at exact-match and rare-term retrieval — if a user asks about a specific token name, protocol, or regulatory term, BM25 will surface documents containing that exact term with high precision, even if the embedding space doesn't cluster them close to the query vector.
+
+**Combining both via `EnsembleRetriever`** with equal weights (0.5 / 0.5) captures the best of both worlds:
+- Dense retrieval finds semantically related content even when phrasing differs
+- BM25 anchors results to exact terminology and rare domain-specific keywords
+- The ensemble uses Reciprocal Rank Fusion (RRF) internally to merge the two ranked lists without score-scale conflicts
+
+**The expanded k=30 pool** (up from k=25) ensures that neither retriever is starved: each contributes 15 candidates, providing the cross-encoder reranker with a richer, more diverse set of passages to score before the final top-5 are selected for the LLM. More diverse candidates → better reranking → higher answer quality.
 
 ---
 
@@ -35,7 +64,7 @@ The system successfully navigates these diverse domains through intelligent retr
 - **FastAPI Backend**: Production-grade REST API with lifespan-managed model loading, health checks, and structured I/O
 - **VRAM-Optimized**: Carefully tuned for GPUs with limited memory (4–5 GB peak usage)
 - **Multi-Domain Expertise**: Handles cryptocurrency, behavioral finance, and AI/ML investment topics
-- **Advanced Retrieval**: k=25 initial retrieval with top-5 reranking for broader context coverage
+- **Hybrid Retrieval**: BM25 + FAISS ensemble (k=30 total) with top-5 cross-encoder reranking for broader, more precise coverage
 - **Enhanced Context Window**: Larger chunk sizes (800 chars) for complex technical explanations
 - **Rapid Development**: Built leveraging proven optimization strategies from previous implementations
 - **Source Citations**: Every answer includes precise document and page references
@@ -56,7 +85,7 @@ The system is served through a FastAPI application, enabling clean HTTP-based ac
 
 ### Lifespan-Managed Model Loading
 
-All models (embeddings, FAISS vector store, LLM pipeline, cross-encoder reranker) are loaded once at startup using FastAPI's `lifespan` context manager and cleanly released on shutdown. This avoids per-request overhead and keeps VRAM usage stable.
+All models (embeddings, FAISS vector store, BM25 keyword retriever, hybrid ensemble, LLM pipeline, cross-encoder reranker) are loaded once at startup using FastAPI's `lifespan` context manager and cleanly released on shutdown. This avoids per-request overhead and keeps VRAM usage stable.
 
 ```python
 @asynccontextmanager
@@ -64,6 +93,12 @@ async def lifespan(app: FastAPI):
     # Load all models on startup
     embeddings = HuggingFaceEmbeddings(model_name='BAAI/bge-small-en-v1.5')
     vector_db = FAISS.load_local('Vector DB Index', embeddings=embeddings, allow_dangerous_deserialization=True)
+    vector_retriever = vector_db.as_retriever(search_kwargs={'k': 15})
+    keyword_retriever = joblib.load('keyword retriever.pkl')
+    keyword_retriever.k = 15
+    hybrid_retriever = EnsembleRetriever(
+        retrievers=[vector_retriever, keyword_retriever], weights=[0.5, 0.5]
+    )
     model = AutoModelForCausalLM.from_pretrained(MODEL, device_map='auto', dtype=torch.bfloat16, low_cpu_mem_usage=True)
     pipe = pipeline(task='text-generation', ...)
     rerank = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device='cuda')
@@ -117,7 +152,8 @@ This project benefited significantly from lessons learned in a previous financia
 
 | Aspect | Previous Project Lesson | Implementation in Crypto RAG |
 |--------|------------------------|------------------------------|
-| **Retrieval** | k=20 → top 3 worked well for focused answers | Extended to k=25 → top 5 for broader crypto context |
+| **Retrieval** | k=20 → top 3 worked well for focused answers | Extended to k=30 hybrid → top 5 for broader crypto context |
+| **Retrieval Type** | Dense-only vector search | Hybrid (Vector + BM25) for superior coverage |
 | **Chunk Size** | 750 chars optimal for financial papers | Increased to 800 chars for cryptocurrency taxonomy |
 | **Temperature** | 0.3 for strict financial analysis | Adjusted to 0.4 for more flexible crypto explanations |
 | **Reranking** | Essential for quality improvement | Implemented immediately, no trial-and-error phase |
@@ -131,18 +167,25 @@ This project benefited significantly from lessons learned in a previous financia
 
 ### Why a 1.5B Model Can Compete with an Unquantized 7B
 
-A raw 7B model has roughly 4–5× more parameters, which gives it a natural advantage in world knowledge, reasoning depth, and language fluency. However, in a RAG setting, the bottleneck is rarely the model size — it's the quality of the context handed to the model. This system closes that gap through three compounding strategies:
+A raw 7B model has roughly 4–5× more parameters, which gives it a natural advantage in world knowledge, reasoning depth, and language fluency. However, in a RAG setting, the bottleneck is rarely the model size — it's the quality of the context handed to the model. This system closes that gap through four compounding strategies:
 
-#### 1. Retrieval Does the Heavy Lifting
+#### 1. Hybrid Retrieval Does the Heavy Lifting
 
-A 7B model responds better to vague queries because it stores more factual knowledge in its weights. In this system, the retrieval pipeline compensates for that: k=25 semantic search followed by cross-encoder reranking guarantees that the 1.5B model always sees the 5 most relevant, precisely scored passages before generating a single token. The model is not asked to "know" anything — it is asked to reason over curated evidence.
+A 7B model responds better to vague queries because it stores more factual knowledge in its weights. In this system, the hybrid retrieval pipeline compensates for that: BM25 + FAISS ensemble search (k=30 total) followed by cross-encoder reranking guarantees that the 1.5B model always sees the 5 most relevant, precisely scored passages before generating a single token. The model is not asked to "know" anything — it is asked to reason over curated evidence.
 
 ```
 Without RAG:    Query → 7B Model (relies on memorized knowledge) → Answer
-This System:    Query → k=25 Retrieval → Cross-Encoder Reranking → Top 5 Chunks → 1.5B Model → Cited Answer
+
+This System:    Query → BM25 Keyword Retrieval (k=15) ─┐
+                                                         ├─ EnsembleRetriever (RRF) → k=30 Candidates
+                Query → FAISS Vector Retrieval (k=15)  ─┘
+                                                         ↓
+                                          Cross-Encoder Reranking → Top 5 Chunks
+                                                         ↓
+                                          1.5B LLM → Cited Answer
 ```
 
-The cross-encoder (`ms-marco-MiniLM-L-6-v2`) scores every query-passage pair jointly, catching nuanced relevance that embedding-based retrieval misses. By the time context reaches the LLM, the retrieval layer has already done the domain-expert filtering that a larger model would otherwise handle through parametric memory.
+The BM25 retriever catches exact-match terminology that embeddings sometimes miss (e.g., specific token names, protocol identifiers, regulatory terms). The FAISS retriever captures semantic similarity even when phrasing varies. The cross-encoder (`ms-marco-MiniLM-L-6-v2`) then scores every query-passage pair jointly, catching nuanced relevance that either retriever alone would miss. By the time context reaches the LLM, two complementary retrieval methods and a reranker have already performed the domain-expert filtering that a larger model would otherwise handle through parametric memory.
 
 #### 2. Prompt Engineering Compensates for Reduced Reasoning Capacity
 
@@ -178,7 +221,7 @@ These parameters collectively keep the 1.5B model in a "reliable zone" where it 
 | **Hardware Required** | Consumer GPU (6GB+) | Professional GPU (16GB+) | Democratized deployment |
 | **Deployment Cost** | Minimal | High | Runs on GTX 1660 Ti, RTX 3060, etc. |
 
-**The bottom line**: In an open-ended chat setting, a 7B model would outperform this system. In a constrained, document-grounded Q&A setting with well-engineered retrieval and prompting, the performance gap becomes marginal — and the efficiency advantage is decisive.
+**The bottom line**: In an open-ended chat setting, a 7B model would outperform this system. In a constrained, document-grounded Q&A setting with well-engineered hybrid retrieval and prompting, the performance gap becomes marginal — and the efficiency advantage is decisive.
 
 ---
 
@@ -189,13 +232,19 @@ PDF Documents → Document Loading → Text Chunking (800 chars, 160 overlap)
                                                         ↓
                                   Embedding Generation (BGE-small-en-v1.5)
                                                         ↓
-                                       FAISS Vector Store (558 chunks)
+                           ┌──────────────────────────────────────────────────┐
+                           │  FAISS Vector Store     BM25 Keyword Retriever   │
+                           │  (Vector DB Index/)     (keyword retriever.pkl)  │
+                           └──────────────────────────────────────────────────┘
                                                         ↓
                               [FastAPI lifespan loads all models at startup]
                                                         ↓
-User Query → POST /ask → Similarity Search (k=25) → Cross-Encoder Reranking (top 5)
-                                                        ↓
-                  Context Formation → LLM Generation (Qwen2.5-1.5B) → Cited Answer → JSON Response
+                         ┌─── Vector Retrieval (k=15) ───┐
+User Query → POST /ask → │                               ├─→ EnsembleRetriever (k=30 total)
+                         └─── BM25 Retrieval (k=15)    ──┘          ↓
+                                                        Cross-Encoder Reranking (top 5)
+                                                                     ↓
+                          Context Formation → LLM Generation (Qwen2.5-1.5B) → Cited Answer → JSON Response
 ```
 
 ---
@@ -204,7 +253,7 @@ User Query → POST /ask → Similarity Search (k=25) → Cross-Encoder Rerankin
 
 ### 1. Document Processing Pipeline
 - **Loader**: PyMuPDFLoader for efficient PDF parsing
-- **Chunking Strategy**: 
+- **Chunking Strategy**:
   - Chunk size: 800 characters (optimized for crypto taxonomy)
   - Overlap: 160 characters (20% for context preservation)
   - Hierarchical separators: `\n\n`, `\n`, `.`, ` `
@@ -213,13 +262,44 @@ User Query → POST /ask → Similarity Search (k=25) → Cross-Encoder Rerankin
 ### 2. Embedding & Vector Store
 - **Model**: `BAAI/bge-small-en-v1.5` (lightweight, domain-agnostic embeddings)
 - **Vector DB**: FAISS for fast similarity search
-- **Storage**: Persistent local storage (`Vector DB Index`) — excluded from version control via `.gitignore`
+- **Storage**: Persistent local storage (`Vector DB Index/`) — excluded from version control via `.gitignore`
 
-### 3. Enhanced Retrieval System
-- **Initial Retrieval**: Top 25 documents via similarity search
-- **Reranking Model**: `cross-encoder/ms-marco-MiniLM-L-6-v2`
-- **Final Selection**: Top 5 most relevant chunks after reranking
-- **Rationale**: Broader initial search captures diverse perspectives; reranking ensures quality
+### 3. Hybrid Retrieval System *(Updated)*
+
+The retrieval pipeline now uses two complementary strategies combined via `EnsembleRetriever`:
+
+**Dense Retrieval (FAISS)**
+- Converts queries and chunks into embedding vectors
+- Retrieves the top 15 semantically closest chunks
+- Strong at: conceptual similarity, paraphrased queries, cross-domain semantics
+
+**Sparse Retrieval (BM25)**
+- Classic TF-IDF-based term frequency ranking
+- Retrieves the top 15 keyword-matched chunks
+- Strong at: exact terminology, rare domain-specific tokens, regulatory terms
+- Serialized to disk as `keyword retriever.pkl` for fast API startup via `joblib`
+
+**Ensemble (EnsembleRetriever)**
+- Combines both retrievers with equal weights: `[0.5, 0.5]`
+- Uses Reciprocal Rank Fusion (RRF) to merge ranked lists
+- Total candidate pool: 30 unique documents (up from 25)
+
+**Reranking**
+- Model: `cross-encoder/ms-marco-MiniLM-L-6-v2`
+- Scores all 30 query-passage pairs jointly
+- Selects the final top 5 for LLM context
+
+```python
+vector_retriever = vector_db.as_retriever(search_kwargs={'k': 15})
+
+keyword_retriever = BM25Retriever.from_documents(chunks)
+keyword_retriever.k = 15
+
+hybrid_retriever = EnsembleRetriever(
+    retrievers=[vector_retriever, keyword_retriever],
+    weights=[0.5, 0.5]
+)
+```
 
 ### 4. Language Model
 - **Model**: Qwen2.5-1.5B-Instruct (efficient instruction-following)
@@ -254,13 +334,35 @@ transformers>=4.30.0
 langchain>=0.1.0
 langchain-community>=0.1.0
 langchain-huggingface>=0.0.1
+langchain-classic>=0.1.0
 sentence-transformers>=2.2.0
 faiss-gpu>=1.7.2
 pymupdf>=1.22.0
 fastapi>=0.100.0
 uvicorn>=0.23.0
 pydantic>=2.0.0
+rank_bm25>=0.2.2
+joblib>=1.3.0
 ```
+
+### Building the Indexes (One-Time Setup)
+
+Run the notebook (`crypto-llm-rag-system.ipynb`) end-to-end to:
+1. Load and chunk the PDFs
+2. Build and save the FAISS vector index (`Vector DB Index/`)
+3. Build and save the BM25 keyword retriever (`keyword retriever.pkl`)
+
+```python
+# Vector index
+vector_db = FAISS.from_documents(chunks, embeddings)
+vector_db.save_local('Vector DB Index')
+
+# BM25 retriever
+keyword_retriever = BM25Retriever.from_documents(chunks)
+joblib.dump(keyword_retriever, 'keyword retriever.pkl')
+```
+
+Both artifacts must be present before starting the API.
 
 ### Running the API
 
@@ -297,17 +399,15 @@ The following are excluded from version control:
 # Vector database (large binary index — regenerate locally)
 Vector DB Index/
 
+# BM25 keyword retriever (regenerate locally)
+keyword retriever.pkl
+
 # Python cache
 __pycache__/
 *.pyc
 ```
 
-The FAISS vector index is excluded because it is large, binary, and fully reproducible by re-running the indexing script against the source PDFs. Committing it would bloat the repository without benefit. To regenerate:
-
-```python
-vector_db = FAISS.from_documents(chunks, embeddings)
-vector_db.save_local('Vector DB Index')
-```
+Both index artifacts are excluded because they are fully reproducible by re-running the indexing notebook against the source PDFs. Committing them would bloat the repository without benefit.
 
 ---
 
@@ -374,13 +474,13 @@ on revenue projections, customer acquisition costs, and exit strategies.
 
 ### Handling Multi-Domain Complexity
 
-**1. Cryptocurrency Taxonomy & Regulatory Content** — Larger chunks (800 chars) preserve complete taxonomy definitions. k=25 initial search captures various classification aspects, and top-5 reranking provides comprehensive coverage.
+**1. Cryptocurrency Taxonomy & Regulatory Content** — Larger chunks (800 chars) preserve complete taxonomy definitions. Hybrid retrieval (k=30) captures both semantic context and exact terminology such as protocol names and regulatory acronyms. Top-5 reranking provides comprehensive, precise coverage.
 
-**2. Computational Decision Theory** — The cross-encoder identifies passages explaining theoretical frameworks. Temperature 0.4 balances precision with explanatory flexibility, while the prompt enforces factual accuracy for computational claims.
+**2. Computational Decision Theory** — BM25 excels at surfacing papers containing exact theoretical terminology. The cross-encoder then identifies the most relevant explanatory passages. Temperature 0.4 balances precision with explanatory flexibility while the prompt enforces factual accuracy.
 
-**3. VC Strategy & AI/ML Applications** — Broader retrieval captures interdisciplinary connections. The reranker prioritizes the most relevant investment framework passages, and the model synthesizes AI-driven strategies with traditional VC approaches.
+**3. VC Strategy & AI/ML Applications** — Broader retrieval captures interdisciplinary connections across both dense and sparse dimensions. The reranker prioritizes the most relevant investment framework passages, and the model synthesizes AI-driven strategies with traditional VC approaches.
 
-**4. Multi-Document Synthesis** — k=25 → top 5 enables pulling insights from all three documents. Context formatting maintains source attribution across domains.
+**4. Multi-Document Synthesis** — k=30 hybrid → top 5 enables pulling insights from all three documents with complementary retrieval signals. Context formatting maintains source attribution across domains.
 
 ---
 
@@ -392,7 +492,7 @@ on revenue projections, customer acquisition costs, and exit strategies.
 - **Domain**: Multi-disciplinary (crypto, behavioral finance, AI/ML)
 
 **System Performance:**
-- **Retrieval Latency**: ~0.8–1.2s for similarity search + reranking (k=25)
+- **Retrieval Latency**: ~1.0–1.5s for hybrid search + reranking (k=30)
 - **Generation Time**: ~3–5s per answer (512 tokens max)
 - **VRAM Usage**: 4–5 GB peak
 - **Citation Consistency**: 100% (every answer includes [Doc:X | Page:Y])
@@ -408,10 +508,13 @@ on revenue projections, customer acquisition costs, and exit strategies.
 | **LLM** | Qwen2.5-1.5B (1.5B params) | ~3 GB |
 | **Precision** | bfloat16 instead of float32 | 50% reduction |
 | **Reranker** | MiniLM-L-6 (lightweight) | ~0.3 GB |
+| **BM25** | CPU-only, no GPU required | 0 GB VRAM |
 | **Device Map** | `auto` for optimal GPU/CPU split | Dynamic |
 | **Low CPU Mem** | `low_cpu_mem_usage=True` | Reduces overhead |
 
 **Total VRAM Usage**: ~4–5 GB (fits on GTX 1660 Ti, RTX 3060, RTX 4060, etc.)
+
+> **Note**: BM25 runs entirely on CPU memory, adding zero VRAM overhead. The hybrid retriever is effectively free in terms of GPU cost.
 
 ---
 
@@ -423,26 +526,34 @@ on revenue projections, customer acquisition costs, and exit strategies.
 rerank = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device='cpu')
 ```
 
-**2. Slow Retrieval**
+**2. Missing Keyword Retriever**
 ```python
-# Reduce initial retrieval if needed
-initial_search = vector_db.similarity_search(query=question, k=15)
+# Regenerate by running the notebook
+keyword_retriever = BM25Retriever.from_documents(chunks)
+joblib.dump(keyword_retriever, 'keyword retriever.pkl')
 ```
 
-**3. Vector DB Not Found**
+**3. Slow Retrieval**
+```python
+# Reduce k per retriever if needed (reduces diversity but speeds up reranking)
+vector_retriever = vector_db.as_retriever(search_kwargs={'k': 10})
+keyword_retriever.k = 10
+```
+
+**4. Vector DB Not Found**
 ```python
 # Regenerate the vector database
 vector_db = FAISS.from_documents(chunks, embeddings)
 vector_db.save_local('Vector DB Index')
 ```
 
-**4. API Not Responding**
+**5. API Not Responding**
 ```bash
 # Verify models are loaded before sending requests
 curl http://localhost:8000/health
 ```
 
-**5. Answers Too Brief or Too Verbose**
+**6. Answers Too Brief or Too Verbose**
 ```python
 temperature=0.3  # More conservative, precise
 temperature=0.5  # More expansive, flexible
@@ -460,6 +571,7 @@ temperature=0.5  # More expansive, flexible
 - [ ] Batch processing endpoint for portfolio analysis queries
 - [ ] Integration with crypto data sources (market cap, trading volumes)
 - [ ] Authentication middleware for the FastAPI app
+- [ ] Tunable ensemble weights per query type (e.g., higher BM25 weight for ticker/symbol queries)
 
 ---
 
@@ -481,6 +593,7 @@ temperature=0.5  # More expansive, flexible
 - [HuggingFace Transformers](https://github.com/huggingface/transformers)
 - [FAISS](https://github.com/facebookresearch/faiss)
 - [Sentence Transformers](https://github.com/UKPLab/sentence-transformers)
+- [rank-bm25](https://github.com/dorianbrown/rank_bm25)
 
 ---
 
